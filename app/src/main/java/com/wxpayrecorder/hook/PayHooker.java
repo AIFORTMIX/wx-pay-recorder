@@ -35,6 +35,8 @@ public class PayHooker {
     private static volatile boolean hookQvOk = false;
     private static volatile boolean hookS1Ok = false;
     private static volatile boolean hookJOk = false;
+    private static volatile boolean hookU1Ok = false;
+    private static volatile boolean hookZcL = false;
     private static volatile boolean hookAaD = false;
     private static volatile boolean hookMsgEntry = false;
     private static volatile boolean hookNotify = false;
@@ -158,6 +160,73 @@ public class PayHooker {
             log("f9.j hook FAIL (ok to ignore): " + t);
         }
 
+        // 3b) Hook com.tencent.mm.storage.f9.U1() — 聊天渲染卡片读取的 content getter
+        //    zc(聊天appmsg card viewitem) 用 f9.U1() 拿完整 appmsg XML 再 ot0.q.v 解析。
+        //    打开收款/转账聊天时必走，可用 XML 字符串解析提取真实 wcpayinfo 字段。
+        try {
+            Class<?> f9Class2 = XposedHelpers.findClass("com.tencent.mm.storage.f9", cl);
+            XposedHelpers.findAndHookMethod(f9Class2, "U1", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    hookU1Ok = true;
+                    hookInfo = "f9.U1()";
+                    tryProcessXml((String) param.getResult());
+                }
+            });
+            hookU1Ok = true;
+            log("f9.U1() hooked");
+        } catch (Throwable t) {
+            log("f9.U1 hook FAIL (ok to ignore): " + t);
+        }
+
+        // 3c) Hook com.tencent.mm.ui.chatting.viewitems.zc.l() — 聊天 appmsg 卡片渲染入口
+        //    无论 UI 如何渲染，只要打开聊天列表中含收款/转账卡片，l() 必被调用并解析 ot0.q。
+        try {
+            Class<?> zcCls = XposedHelpers.findClass("com.tencent.mm.ui.chatting.viewitems.zc", cl);
+            java.lang.reflect.Method[] zcM = zcCls.getDeclaredMethods();
+            int zcHooked = 0;
+            for (java.lang.reflect.Method m : zcM) {
+                if (m.getName().equals("l") && m.getParameterTypes().length == 4) {
+                    Class<?>[] pts = m.getParameterTypes();
+                    try {
+                        XposedHelpers.findAndHookMethod(zcCls, "l",
+                                pts[0], pts[1], pts[2], String.class, new XC_MethodHook() {
+                                    @Override
+                                    protected void afterHookedMethod(MethodHookParam param) {
+                                        hookZcL = true;
+                                        hookInfo = "zc.l(bindCard)";
+                                        // 从参数 2 (Lrd5/d) 的 .d.a.b 提取 f9 消息对象
+                                        try {
+                                            Object bind = param.args[2];
+                                            Object we5 = XposedHelpers.getObjectField(bind, "d");
+                                            Object f9obj = XposedHelpers.getObjectField(we5, "b");
+                                            if (f9obj != null) {
+                                                String xml = strOf(XposedHelpers.callMethod(f9obj, "U1"));
+                                                if (xml == null)
+                                                    xml = strOf(XposedHelpers.callMethod(f9obj, "j"));
+                                                if (xml != null && xml.contains("wcpayinfo")) {
+                                                    tryProcessXml(xml);
+                                                }
+                                            }
+                                        } catch (Throwable ignore) {
+                                        }
+                                    }
+                                });
+                        zcHooked++;
+                    } catch (Throwable ignore) {
+                    }
+                }
+            }
+            if (zcHooked > 0) {
+                hookZcL = true;
+                log("zc.l() hooked, " + zcHooked + " overload");
+            } else {
+                log("zc: no l(g0,yb5/d,rd5/d,String) found");
+            }
+        } catch (Throwable t) {
+            log("zc hook FAIL (ok to ignore): " + t);
+        }
+
         // 4) Hook com.tencent.mm.sdk.platformtools.aa.d(...) — 底层 XML 解析器
         //    这是微信解析任何消息 XML 的必经静态方法。遍历所有名为 d 的方法，
         //    只要参数里有 String（XML），回调时就检查是否含 wcpayinfo。
@@ -276,7 +345,8 @@ public class PayHooker {
         if (cachedError == null) {
             cachedClassFound = "ot0.q";
             cachedMethodFound = "q.v=" + hookQvOk + " f9.S1=" + hookS1Ok
-                    + " f9.j=" + hookJOk + " aa.d=" + hookAaD
+                    + " f9.j=" + hookJOk + " f9.U1=" + hookU1Ok + " zc.l=" + hookZcL
+                    + " aa.d=" + hookAaD
                     + " msgEntry=" + hookMsgEntry + " notify=" + hookNotify;
         }
 
@@ -622,10 +692,19 @@ public class PayHooker {
         Context ctx = getContext();
         if (ctx == null) return;
         try {
+            // 有真实单号(transcationid/transferid)时走 insertReal 对账合并：
+            // 把同金额相近时间的占位通知记录替换成真实单号+真实字段；
+            // 否则(mesh 通知占位)走普通 insert。
+            boolean hasRealOrder = !firstNonEmpty(transcationid, transferid).isEmpty();
+            String method = hasRealOrder
+                    ? PayRecordProvider.METHOD_INSERT_REAL
+                    : PayRecordProvider.METHOD_INSERT;
             Bundle result = ctx.getContentResolver().call(
-                    PayRecordProvider.URI, PayRecordProvider.METHOD_INSERT, null, b);
+                    PayRecordProvider.URI, method, null, b);
             boolean inserted = result != null && result.getBoolean("inserted", false);
-            log("insert orderNo=" + orderNo + " amount=" + amountCent + " inserted=" + inserted);
+            boolean merged = result != null && result.getBoolean("merged", false);
+            log("insert orderNo=" + orderNo + " amount=" + amountCent
+                    + " real=" + hasRealOrder + " inserted=" + inserted + " merged=" + merged);
             if (inserted) {
                 recordCount++;
                 payMsgCount++;
