@@ -21,20 +21,34 @@ jobs:
 
       - name: Set up Android SDK
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager --install "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
-          echo "SDK setup done"
+
+      - name: Generate signing keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore $HOME/release.keystore \
+            -alias release \
+            -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -storepass wxpay2026 \
+            -keypass wxpay2026 \
+            -dname "CN=wx-pay-recorder, OU=dev, O=wxpayrecorder, L=CN, ST=CN, C=CN"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Build release APK
+      - name: Build signed release APK
+        env:
+          KEYSTORE_FILE: ${{ env.HOME }}/release.keystore
+          KEYSTORE_PASSWORD: wxpay2026
+          KEY_ALIAS: release
+          KEY_PASSWORD: wxpay2026
         run: gradle --no-daemon :app:assembleRelease
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: wx-pay-recorder-release
-          path: app/build/outputs/apk/release/*.apk
+          name: wx-pay-recorder
+          path: app/build/outputs/apk/release/app-release.apk

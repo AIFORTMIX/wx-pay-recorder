@@ -12,10 +12,30 @@ android {
         versionName "1.0"
     }
 
+    signingConfigs {
+        release {
+            // CI 中通过环境变量传入；本地开发可用 debug 签名兜底
+            def storeFilePath = System.env.KEYSTORE_FILE
+            if (storeFilePath != null && new File(storeFilePath).exists()) {
+                storeFile file(storeFilePath)
+                storePassword System.env.KEYSTORE_PASSWORD
+                keyAlias System.env.KEY_ALIAS
+                keyPassword System.env.KEY_PASSWORD
+            } else {
+                // 兜底：使用 debug 签名
+                storeFile file("${System.getProperty('user.home')}/.android/debug.keystore")
+                storePassword "android"
+                keyAlias "androiddebugkey"
+                keyPassword "android"
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
         }
     }
 
