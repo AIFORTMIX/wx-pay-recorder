@@ -37,6 +37,7 @@ public class PayHooker {
     private static volatile boolean hookJOk = false;
     private static volatile boolean hookAaD = false;
     private static volatile boolean hookMsgEntry = false;
+    private static volatile boolean hookNotify = false;
     private static volatile String hookInfo = "";
 
     // 缓存调试消息，等 appContext 就绪后补发
@@ -216,17 +217,65 @@ public class PayHooker {
             log("ww1.c2.b hook FAIL (ok to ignore): " + t);
         }
 
+        // 6) HOOK NotificationManager.notify — Android 框架层通知，后台收到
+        //    每条需要提示的新消息/收款都会走这里，是最可靠的真实触发点。
+        try {
+            Class<?> nmClass = XposedHelpers.findClass("android.app.NotificationManager", cl);
+            XposedHelpers.findAndHookMethod(nmClass, "notify", String.class, int.class,
+                    android.app.Notification.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            hookNotify = true;
+                            hookInfo = "NotificationManager.notify";
+                            try {
+                                android.app.Notification n = (android.app.Notification) param.args[2];
+                                if (n != null) {
+                                    StringBuilder sb = new StringBuilder();
+                                    try {
+                                        android.content.Context ctx = getContext();
+                                        String t = null, txt = null;
+                                        if (android.os.Build.VERSION.SDK_INT >= 19) {
+                                            t = n.extras == null ? null
+                                                    : String.valueOf(n.extras.getCharSequence("android.title"));
+                                            txt = n.extras == null ? null
+                                                    : String.valueOf(n.extras.getCharSequence("android.text"));
+                                        }
+                                        sb.append("title=").append(t).append("\n");
+                                        sb.append("text=").append(txt).append("\n");
+                                        // 从通知文案中识别金额（收款到账提示常含金额）
+                                        String all = (t == null ? "" : t) + (txt == null ? "" : txt);
+                                        java.util.regex.Matcher m = amountPat.matcher(all);
+                                        if (m.find()) {
+                                            sb.append("APPARENT_AMOUNT=").append(m.group()).append("\n");
+                                        }
+                                    } catch (Throwable ignore) {
+                                    }
+                                    sendDebugMsg("notification", "notify", sb.toString());
+                                }
+                            } catch (Throwable ignore) {
+                            }
+                        }
+                    });
+            hookNotify = true;
+            log("NotificationManager.notify hooked");
+        } catch (Throwable t) {
+            log("NotificationManager.notify hook FAIL: " + t);
+        }
+
         // 汇总 hook 状态（如果有更详细的信息则覆盖）
         if (cachedError == null) {
             cachedClassFound = "ot0.q";
             cachedMethodFound = "q.v=" + hookQvOk + " f9.S1=" + hookS1Ok
                     + " f9.j=" + hookJOk + " aa.d=" + hookAaD
-                    + " msgEntry=" + hookMsgEntry;
+                    + " msgEntry=" + hookMsgEntry + " notify=" + hookNotify;
         }
 
         // 如果 context 已可用就立即上报，否则等 Application.attach
         flushBufferedStatus();
     }
+
+    private static final java.util.regex.Pattern amountPat =
+            java.util.regex.Pattern.compile("[¥￥]\\s?\\d{1,3}(:?[.,]\\d{1,2})?\\b");
 
     /**
      * 从消息对象 f9 中提取 talker/type/内容，写入调试消息流。
