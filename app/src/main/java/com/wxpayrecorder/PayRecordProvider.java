@@ -5,21 +5,12 @@ import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.CancellationSignal;
-
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 
 import com.wxpayrecorder.db.DbHelper;
 
 /**
  * 跨进程接收微信 hook 写入的收款记录。
  * authority: com.wxpayrecorder.provider
- *
- * 调用约定（由微信进程里的 Hooker 使用）：
- *   ContentResolver.call(uri, "insert", null, bundle)
- *   bundle 键：orderNo, amountCent, timeMillis, paySubType, goodsName, sender, feedesc, rawXml
- *   bundle 键：query 时传入 "start"/"limit"
  */
 public class PayRecordProvider extends android.content.ContentProvider {
 
@@ -39,9 +30,8 @@ public class PayRecordProvider extends android.content.ContentProvider {
         return true;
     }
 
-    @Nullable
     @Override
-    public Bundle call(@NonNull String method, @Nullable String arg, @Nullable Bundle extras) {
+    public Bundle call(String method, String arg, Bundle extras) {
         Bundle result = new Bundle();
         switch (method) {
             case METHOD_INSERT:
@@ -56,7 +46,6 @@ public class PayRecordProvider extends android.content.ContentProvider {
                 r.feedesc = extras.getString("feedesc");
                 r.rawXml = extras.getString("rawXml");
                 long row = db.insert(r);
-                // rowId == -1 表示 orderNo 已存在，忽略
                 result.putBoolean("inserted", row != -1);
                 return result;
             case METHOD_COUNT:
@@ -76,27 +65,24 @@ public class PayRecordProvider extends android.content.ContentProvider {
                 Uri.parse(AUTHORITY + "/records"), null, null, null, null);
     }
 
-    // 以下 CRUD 本模块不使用，实现为空以符合抽象类要求。
-    @Nullable
     @Override
-    public Cursor query(@NonNull Uri uri, @Nullable String[] projection, @Nullable String selection,
-                        @Nullable String[] selectionArgs, @Nullable String sortOrder) {
+    public Cursor query(Uri uri, String[] projection, String selection,
+                        String[] selectionArgs, String sortOrder) {
         return db.getReadableDatabase().query(DbHelper.TABLE, projection, selection,
                 selectionArgs, null, null, sortOrder);
     }
 
-    @Nullable
     @Override
-    public String getType(@NonNull Uri uri) { return null; }
+    public String getType(Uri uri) { return null; }
 
     @Override
-    public int update(@NonNull Uri uri, @Nullable ContentValues values,
-                      @Nullable String selection, @Nullable String[] selectionArgs) { return 0; }
+    public int update(Uri uri, ContentValues values,
+                      String selection, String[] selectionArgs) { return 0; }
 
     @Override
-    public int delete(@NonNull Uri uri, @Nullable String selection,
-                      @Nullable String[] selectionArgs) { return db.deleteAll(); }
+    public int delete(Uri uri, String selection,
+                      String[] selectionArgs) { return db.deleteAll(); }
 
     @Override
-    public Uri insert(@NonNull Uri uri, @Nullable ContentValues values) { return null; }
+    public Uri insert(Uri uri, ContentValues values) { return null; }
 }
