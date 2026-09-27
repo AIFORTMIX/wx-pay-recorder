@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:label="微信收款记录"
+        android:icon="@android:drawable/ic_menu_agenda"
+        android:theme="@android:style/Theme.DeviceDefault.Light"
+        android:allowBackup="false"
+        tools:ignore="MissingApplicationIcon">
+
+        <!-- ========== LSPosed 模块声明 ========== -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="记录微信二维码收款(金额/订单号/时间/类型/商品名)到本地" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+        <meta-data
+            android:name="xposedscope"
+            android:value="com.tencent.mm" />
+
+        <!-- 查看记录的界面 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 
+          ContentProvider：微信进程里的 hook 代码通过它把收款记录写入本应用数据库。
+          exported=true + custom authority，跨 UID 可访问。
+        -->
+        <provider
+            android:name=".PayRecordProvider"
+            android:authorities="com.wxpayrecorder.provider"
+            android:exported="true"
+            tools:ignore="ExportedContentProvider" />
+    </application>
+</manifest>

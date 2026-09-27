@@ -1,0 +1,32 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.wxpayrecorder'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.wxpayrecorder"
+        minSdk 28
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    // Xposed API：只用于编译（compileOnly），运行时由 LSPosed 提供
+    compileOnly 'de.robv.android.xposed:api:82'
+    compileOnly 'de.robv.android.xposed:api:82:sources'
+}

@@ -1,0 +1,15 @@
+# Gradle
+.gradle/
+build/
+
+# Android Studio
+local.properties
+*.iml
+.idea/
+.cxx/
+
+# OS
+.DS_Store
+
+# 解包分析用的中间产物不需要入库
+*.zip
