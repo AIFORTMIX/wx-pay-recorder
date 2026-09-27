@@ -2,7 +2,6 @@ package com.wxpayrecorder.hook;
 
 import android.app.Application;
 import android.content.Context;
-import android.content.res.Resources;
 
 import com.wxpayrecorder.PayRecordProvider;
 
@@ -18,100 +17,122 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * 核心 Hooker。
  *
- * 方案：
- *  - hook 微信统一的 AppMsg 解析入口 ot0.q(String) -> ot0.q 对象；
- *  - 该对象含 wcpayinfo 字段（金额/订单号/类型/备注/收付款人）；
- *  - 判断是否为"二维码收款"（见 shouldRecord）：receiver 是自己 且 feedesc 含关键词；
- *  - 通过 ContentProvider 写入本模块数据库（orderNo 唯一去重）。
- *
- * 注意：微信是强混淆应用，ot0/字段名等是真实运行时的类名/字段名（jadx 未改名）。
+ * hook ot0.q(String) 解析 wcpayinfo 收款卡片，
+ * 通过 ContentProvider 写入本模块数据库，
+ * 同时通过心跳机制上报 hook 状态供 App 端验证。
  */
 public class PayHooker {
 
-    // 用于记录应用 Context（provider 调用需要）
     private static volatile Context appContext;
+    private static volatile boolean hookInstalled = false;
+    private static volatile int msgCount = 0;
 
-    // 可配置的"收款"判定关键词，空列表 = 只按 receiver==自己 判断。
-    private static final List<String> RECORD_KEYWORDS = new ArrayList<>(java.util.Collections.singletonList("二维码收款"));
+    private static final List<String> RECORD_KEYWORDS =
+            new ArrayList<>(java.util.Collections.singletonList("二维码收款"));
 
     private PayHooker() {
     }
 
     public static void install(XC_LoadPackage.LoadPackageParam lpparam) {
-        // 1) 捕获 Application Context（provider 需要）
+        // 1) 捕获 Application Context
         try {
             XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class,
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             appContext = (Context) param.thisObject;
+                            // 上报：模块已加载 + Application Context 就绪
+                            sendHeartbeat(PayRecordProvider.KEY_HOOK_INSTALLED, "true");
                         }
                     });
         } catch (Throwable t) {
-            // 老的 hook API 下 attach 可能在更早调用；不影响后续兜底
+            // attach 失败不影响后续 hook
         }
 
-        // 2) hook 统一的 AppMsg 解析入口
+        // 2) hook AppMsg 解析入口
         final ClassLoader cl = lpparam.classLoader;
+        final String targetClass = "ot0.q";
+        final String targetMethod = "v";
+
+        Class<?> appMsg;
         try {
-            final Class<?> appMsg = XposedHelpers.findClass("ot0.q", cl);
-            final String targetMethod = "v";
-            // 确认方法存在
-            for (Method m : appMsg.getDeclaredMethods()) {
-                if (m.getName().equals(targetMethod) && m.getParameterTypes().length == 1
-                        && m.getParameterTypes()[0] == String.class) {
-                    XposedHelpers.findAndHookMethod(appMsg, targetMethod, String.class,
-                            new XC_MethodHook() {
-                                @Override
-                                protected void afterHookedMethod(MethodHookParam param) {
-                                    try {
-                                        Object q = param.getResult();
-                                        if (q == null) return;
-                                        boolean isPay = isWcPayInfo(q);
-                                        if (!isPay) return;
-                                        if (!shouldRecord(q, cl)) return;
-                                        sendRecord(q, (String) param.args[0], cl);
-                                    } catch (Throwable ignore) {
-                                        // hook 不应影响微信正常运行
-                                    }
-                                }
-                            });
-                    return; // 只 hook 一次
-                }
+            appMsg = XposedHelpers.findClass(targetClass, cl);
+        } catch (Throwable t) {
+            // 类找不到 → 上报错误
+            sendHeartbeat(PayRecordProvider.KEY_HOOK_ERROR,
+                    "类 " + targetClass + " 未找到: " + t.getMessage());
+            return;
+        }
+
+        sendHeartbeat(PayRecordProvider.KEY_HOOK_CLASS_FOUND, targetClass);
+
+        // 查找目标方法
+        Method foundMethod = null;
+        for (Method m : appMsg.getDeclaredMethods()) {
+            if (m.getName().equals(targetMethod) && m.getParameterTypes().length == 1
+                    && m.getParameterTypes()[0] == String.class) {
+                foundMethod = m;
+                break;
             }
-            // 若签名不同，退化的通用查找
+        }
+
+        if (foundMethod == null) {
+            // 退化：查找同名单参数方法
             for (Method m : appMsg.getDeclaredMethods()) {
                 if (m.getName().equals(targetMethod) && m.getParameterTypes().length == 1) {
-                    XposedHelpers.findAndHookMethod(appMsg, targetMethod,
-                            m.getParameterTypes(), new XC_MethodHook() {
-                                @Override
-                                protected void afterHookedMethod(MethodHookParam param) {
-                                    try {
-                                        Object q = param.getResult();
-                                        if (q == null) return;
-                                        if (!isWcPayInfo(q)) return;
-                                        if (!shouldRecord(q, cl)) return;
-                                        sendRecord(q, String.valueOf(param.args[0]), cl);
-                                    } catch (Throwable ignore) {
-                                    }
-                                }
-                            });
-                    return;
+                    foundMethod = m;
+                    break;
                 }
             }
-        } catch (Throwable t) {
-            // 类名变化：将触发记录到日志
         }
+
+        if (foundMethod == null) {
+            sendHeartbeat(PayRecordProvider.KEY_HOOK_ERROR,
+                    "方法 " + targetMethod + "(String) 在 " + targetClass + " 中未找到");
+            return;
+        }
+
+        sendHeartbeat(PayRecordProvider.KEY_HOOK_METHOD_FOUND,
+                targetMethod + "(" + foundMethod.getParameterTypes()[0].getSimpleName() + ")");
+        hookInstalled = true;
+
+        // hook 目标方法
+        XposedHelpers.findAndHookMethod(appMsg, targetMethod,
+                foundMethod.getParameterTypes(), new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            Object q = param.getResult();
+                            if (q == null) return;
+
+                            if (!isWcPayInfo(q)) return;
+
+                            // 上报每次支付消息解析（含非收款）
+                            String feedesc = str(get(q, "J0"));
+                            sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_TIME,
+                                    String.valueOf(System.currentTimeMillis()));
+                            sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_TYPE,
+                                    "feedesc=" + (feedesc == null ? "null" : feedesc));
+                            sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_AMOUNT,
+                                    "amount=" + num(get(q, "Q0")) + "分");
+
+                            if (!shouldRecord(q, cl)) return;
+                            sendRecord(q, (String) param.args[0], cl);
+                            msgCount++;
+                            sendHeartbeat(PayRecordProvider.KEY_MSG_COUNT,
+                                    String.valueOf(msgCount));
+                        } catch (Throwable ignore) {
+                        }
+                    }
+                });
     }
 
-    // -------- 判定与提取（全部用反射读取字段，避免编译期依赖微信类） --------
+    // -------- 判定与提取 --------
 
-    /** 是否为 wcpayinfo 支付卡片：含 paysubtype / feedesc 字段即可认为支付相关内容。 */
     private static boolean isWcPayInfo(Object q) {
         return !isEmpty(str(get(q, "J0"))) || get(q, "I0") != null;
     }
 
-    /** 仅记录"二维码收款"：feedesc 命中关键词（可配置）。 */
     private static boolean shouldRecord(Object q, ClassLoader cl) {
         String feedesc = str(get(q, "J0"));
         if (RECORD_KEYWORDS.isEmpty()) return true;
@@ -123,20 +144,17 @@ public class PayHooker {
 
     private static void sendRecord(Object q, String rawXml, ClassLoader cl) {
         StringBuilder order = new StringBuilder();
-        order.append(str(get(q, "K0")));   // transcationid
-        if (order.length() == 0) order.append(str(get(q, "L0"))); // transferid
+        order.append(str(get(q, "K0")));
+        if (order.length() == 0) order.append(str(get(q, "L0")));
         String orderNo = order.toString().trim();
         if (orderNo.length() == 0) {
-            // 无订单号时用原始 xml 做去重键
             orderNo = "raw-" + Integer.toHexString(rawXml == null ? 0 : rawXml.hashCode());
         }
 
-        long amountCent = num(get(q, "Q0"));   // total_fee，单位分
-        // 商品名/描述: feedesc 优先，其次 title
+        long amountCent = num(get(q, "Q0"));
         String goods = firstNonEmpty(str(get(q, "J0")), str(get(q, "f")));
-        // 对方备注: 付款方填写的备注 pay_memo
         String memo = str(get(q, "X1"));
-        String sender = str(get(q, "O0"));     // payer_username
+        String sender = str(get(q, "O0"));
         int subType = (int) num(get(q, "I0"));
 
         android.os.Bundle b = new android.os.Bundle();
@@ -159,18 +177,24 @@ public class PayHooker {
         }
     }
 
+    // -------- 心跳上报 --------
+
+    private static void sendHeartbeat(String key, String value) {
+        Context ctx = getContext();
+        if (ctx == null) return;
+        try {
+            android.os.Bundle b = new android.os.Bundle();
+            b.putString(key, value);
+            ctx.getContentResolver().call(PayRecordProvider.URI,
+                    PayRecordProvider.METHOD_HEARTBEAT, null, b);
+        } catch (Throwable ignore) {
+        }
+    }
+
     // -------- 反射辅助 --------
 
     private static Context getContext() {
-        if (appContext != null) return appContext;
-        // 兜底：扫描已 attach 的全局 Application
-        try {
-            Field f = Application.class.getDeclaredField("mBase");
-            // 无法直接获得全局单例，返回 null 等下一次回调
-            return null;
-        } catch (Throwable t) {
-            return null;
-        }
+        return appContext;
     }
 
     private static Object get(Object obj, String field) {

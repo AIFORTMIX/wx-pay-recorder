@@ -12,12 +12,14 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 本地 SQLite。orderNo 设为唯一键实现去重：同一笔收款若微信重复解析也不会重复入库。
+ * 本地 SQLite。
+ * - pay_record: 收款记录，orderNo 唯一键去重
+ * - hook_status: hook 心跳状态，供 App 端读取
  */
 public class DbHelper extends SQLiteOpenHelper {
 
     public static final String DB = "records.db";
-    public static final int VERSION = 2;
+    public static final int VERSION = 3;
 
     public static final String TABLE = "pay_record";
     public static final String COL_ID = "_id";
@@ -30,6 +32,12 @@ public class DbHelper extends SQLiteOpenHelper {
     public static final String COL_SENDER = "sender";
     public static final String COL_FEEDESC = "feedesc";
     public static final String COL_RAW = "raw_xml";
+
+    // hook_status 表
+    public static final String TABLE_STATUS = "hook_status";
+    public static final String COL_S_KEY = "key";
+    public static final String COL_S_VALUE = "value";
+    public static final String COL_S_TIME = "updated_at";
 
     public DbHelper(Context c) {
         super(c, DB, null, VERSION);
@@ -49,22 +57,32 @@ public class DbHelper extends SQLiteOpenHelper {
                 + COL_FEEDESC + " TEXT,"
                 + COL_RAW + " TEXT"
                 + ")");
+        db.execSQL("CREATE TABLE " + TABLE_STATUS + " ("
+                + COL_S_KEY + " TEXT PRIMARY KEY,"
+                + COL_S_VALUE + " TEXT,"
+                + COL_S_TIME + " INTEGER DEFAULT 0"
+                + ")");
     }
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int oldV, int newV) {
         if (oldV < 2) {
-            // v1 -> v2: 新增 memo 列（对方备注）
             try {
                 db.execSQL("ALTER TABLE " + TABLE + " ADD COLUMN " + COL_MEMO + " TEXT");
             } catch (Throwable ignore) {
             }
         }
+        if (oldV < 3) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS " + TABLE_STATUS + " ("
+                    + COL_S_KEY + " TEXT PRIMARY KEY,"
+                    + COL_S_VALUE + " TEXT,"
+                    + COL_S_TIME + " INTEGER DEFAULT 0"
+                    + ")");
+        }
     }
 
-    /**
-     * 返回 SQLiteDatabase.CONFLICT_IGNORE，重复 orderNo 直接静默忽略。
-     */
+    // -------- 收款记录 --------
+
     public long insert(PayRecord r) {
         SQLiteDatabase db = getWritableDatabase();
         ContentValues v = new ContentValues();
@@ -117,5 +135,34 @@ public class DbHelper extends SQLiteOpenHelper {
         r.feedesc = c.getString(c.getColumnIndexOrThrow(COL_FEEDESC));
         r.rawXml = c.getString(c.getColumnIndexOrThrow(COL_RAW));
         return r;
+    }
+
+    // -------- hook 状态 --------
+
+    public void putStatus(String key, String value) {
+        SQLiteDatabase db = getWritableDatabase();
+        ContentValues v = new ContentValues();
+        v.put(COL_S_KEY, key);
+        v.put(COL_S_VALUE, value);
+        v.put(COL_S_TIME, System.currentTimeMillis());
+        db.insertWithOnConflict(TABLE_STATUS, null, v, SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public String getStatus(String key) {
+        SQLiteDatabase db = getReadableDatabase();
+        try (Cursor c = db.query(TABLE_STATUS, new String[]{COL_S_VALUE},
+                COL_S_KEY + "=?", new String[]{key}, null, null, null, "1")) {
+            if (c.moveToFirst()) return c.getString(0);
+        }
+        return null;
+    }
+
+    public long getStatusTime(String key) {
+        SQLiteDatabase db = getReadableDatabase();
+        try (Cursor c = db.query(TABLE_STATUS, new String[]{COL_S_TIME},
+                COL_S_KEY + "=?", new String[]{key}, null, null, null, "1")) {
+            if (c.moveToFirst()) return c.getLong(0);
+        }
+        return 0;
     }
 }
