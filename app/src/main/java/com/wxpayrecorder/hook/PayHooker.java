@@ -84,7 +84,7 @@ public class PayHooker {
             cachedError = "Application.attach hook失败: " + t.getMessage();
         }
 
-        // 1) Hook ot0.q.v(String) — 原始方案
+        // 1) Hook ot0.q.v(String) — 用户打开聊天时解析 appmsg，能拿到真实字段
         try {
             Class<?> appMsgClass = XposedHelpers.findClass("ot0.q", cl);
             boolean found = false;
@@ -98,6 +98,12 @@ public class PayHooker {
                                 protected void afterHookedMethod(MethodHookParam param) {
                                     hookQvOk = true;
                                     hookInfo = "ot0.q.v(String)";
+                                    // 用返回的 ot0.q 对象直接读真实字段
+                                    Object q = param.getResult();
+                                    if (q != null && isInterestingQ(q)) {
+                                        recordFromQObject(q);
+                                    }
+                                    // 兜底：仍然把原始 XML 交给字符串解析
                                     tryProcessXml((String) param.args[0]);
                                 }
                             });
@@ -282,6 +288,93 @@ public class PayHooker {
             java.util.regex.Pattern.compile("[¥￥]\\s?\\d{1,3}(?:[.,]\\d{1,2})?\\b|收款\\s?(\\d+(?:[,.]\\d{1,2})?)\\s?元");
 
     /**
+     * 判断 ot0.q 对象是否是收款相关 appmsg（含 wcpayinfo 字段）。
+     * 微信 appmsg 解析出的对象，若 transcationid/transferid/total_fee 任一存在即为支付消息。
+     */
+    private static boolean isInterestingQ(Object q) {
+        if (q == null) return false;
+        try {
+            Object tid = XposedHelpers.getObjectField(q, "K0"); // transcationid
+            Object fid = XposedHelpers.getObjectField(q, "L0"); // transferid
+            Object totalFee = XposedHelpers.getObjectField(q, "Q0"); // total_fee
+            if ((tid != null && !String.valueOf(tid).isEmpty())
+                    || (fid != null && !String.valueOf(fid).isEmpty())
+                    || (totalFee != null && ((Number) totalFee).intValue() > 0)) {
+                return true;
+            }
+        } catch (Throwable ignore) {
+        }
+        return false;
+    }
+
+    /**
+     * 从 ot0.q 对象读取真实收款字段并入库（合并/替换占位记录）。
+     * 字段映射（来自微信 8.0.74 反编译）：
+     *  K0=transcationid, L0=transferid, J0=feedesc, Q0=total_fee(分),
+     *  X1=pay_memo, O0=payer_username, I0=paysubtype
+     */
+    private static void recordFromQObject(Object q) {
+        try {
+            String transcationid = strOf(XposedHelpers.getObjectField(q, "K0"));
+            String transferid = strOf(XposedHelpers.getObjectField(q, "L0"));
+            String feedesc = strOf(XposedHelpers.getObjectField(q, "J0"));
+            String payMemo = strOf(XposedHelpers.getObjectField(q, "X1"));
+            String payer = strOf(XposedHelpers.getObjectField(q, "O0"));
+            long totalFeeCent = 0;
+            int subType = 0;
+            try {
+                totalFeeCent = ((Number) XposedHelpers.getObjectField(q, "Q0")).longValue();
+            } catch (Throwable ignore) {
+            }
+            try {
+                subType = ((Number) XposedHelpers.getObjectField(q, "I0")).intValue();
+            } catch (Throwable ignore) {
+            }
+
+            String orderNo = firstNonEmpty(transcationid, transferid);
+            if (orderNo == null || orderNo.isEmpty()) orderNo = "raw-real-" + Integer.toHexString(String.valueOf(transcationid).hashCode());
+
+            // 去重
+            synchronized (processedOrders) {
+                if (processedOrders.contains(orderNo)) return;
+                processedOrders.add(orderNo);
+                if (processedOrders.size() > 5000) processedOrders.clear();
+            }
+
+            log("ot0.q real: order=" + orderNo + " fee=" + totalFeeCent
+                    + " feedesc=" + feedesc + " memo=" + payMemo + " payer=" + payer);
+
+            Bundle b = new Bundle();
+            b.putString("orderNo", orderNo);
+            b.putLong("amountCent", totalFeeCent);
+            b.putLong("timeMillis", System.currentTimeMillis());
+            b.putInt("paySubType", subType);
+            b.putString("goodsName", feedesc == null ? "" : feedesc);
+            b.putString("memo", payMemo);
+            b.putString("sender", payer);
+            b.putString("feedesc", feedesc);
+            b.putString("rawXml", "[ot0.q] order=" + orderNo + " fee=" + totalFeeCent
+                    + " memo=" + payMemo);
+            Context ctx = getContext();
+            if (ctx == null) return;
+            try {
+                Bundle result = ctx.getContentResolver().call(
+                        PayRecordProvider.URI, PayRecordProvider.METHOD_INSERT_REAL, null, b);
+                boolean inserted = result != null && result.getBoolean("inserted", false);
+                log("ot0.q insertReal inserted=" + inserted);
+                if (inserted) {
+                    recordCount++;
+                    payMsgCount++;
+                    sendHeartbeat(PayRecordProvider.KEY_MSG_COUNT, String.valueOf(recordCount));
+                }
+            } catch (Throwable ignore) {
+            }
+        } catch (Throwable t) {
+            log("recordFromQObject FAIL: " + t);
+        }
+    }
+
+    /**
      * 直接从通知栏文案解析并记录收款。
      * 收款到账通知文本示例：title=微信收款助手  text=微信支付收款0.01元(朋友到店)
      */
@@ -320,16 +413,9 @@ public class PayHooker {
         }
         if (amountCent <= 0) return;
 
-        // 备注/商品名：括号内的内容，如"朋友到店"
+        // 备注/商品名暂不填写（用户确认：通知里无法可靠区分，等 ot0.q 补录真实值）
         String remark = "";
-        java.util.regex.Matcher br = java.util.regex.Pattern
-                .compile("\\((.*?)\\)|（(.*?)）").matcher(text);
-        if (br.find()) {
-            remark = br.group(1) != null ? br.group(1).trim() : br.group(2).trim();
-        }
-        String goodsName = text.replaceAll("微信支付收款\\s?\\d[.,]?\\d{0,2}\\s?元", "")
-                .replaceAll("[\\(\\)（）]", "").trim();
-        if (goodsName.isEmpty()) goodsName = "收款";
+        String goodsName = "";
 
         // 订单号：通知里没有，用时间戳生成（同一毫秒去重可接受）
         String orderNo = "notify-" + System.currentTimeMillis();
@@ -341,7 +427,7 @@ public class PayHooker {
             if (processedOrders.size() > 5000) processedOrders.clear();
         }
 
-        // 写入数据库
+        // 写入数据库（占位记录，保留金额/时间以便后续用真实单号合并）
         Bundle b = new Bundle();
         b.putString("orderNo", orderNo);
         b.putLong("amountCent", amountCent);

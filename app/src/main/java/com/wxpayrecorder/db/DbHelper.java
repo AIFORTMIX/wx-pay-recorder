@@ -129,6 +129,51 @@ public class DbHelper extends SQLiteOpenHelper {
         }
     }
 
+    /**
+     * 插入真实记录：优先把同金额相近时间的占位通知记录改为真实单号+真实字段，
+     * 否则作为新记录插入。
+     */
+    public long insertReal(PayRecord r) {
+        if (r.orderNo != null && replacePlaceholderByAmount(r, r.orderNo, r.amountCent, r.timeMillis)) {
+            return r.orderNo.hashCode() & 0x7fffffff; // 已更新，返回非 -1
+        }
+        return insert(r);
+    }
+
+    /**
+     * 用真实记录替换同金额、相近时间窗口内的占位通知记录（order_no 以 notify-/raw- 开头）。
+     * @return 是否更新了记录
+     */
+    public boolean replacePlaceholderByAmount(PayRecord r, String realOrder, long amountCent, long timeMillis) {
+        SQLiteDatabase db = getWritableDatabase();
+        // 时间窗口：前后 10 分钟
+        long from = timeMillis - 10 * 60 * 1000;
+        long to = timeMillis + 10 * 60 * 1000;
+        long id = -1;
+        try (Cursor c = db.query(TABLE, new String[]{COL_ID, COL_ORDER},
+                COL_AMOUNT + "=? AND " + COL_TIME + " BETWEEN ? AND ?",
+                new String[]{String.valueOf(amountCent), String.valueOf(from), String.valueOf(to)},
+                null, null, COL_TIME + " DESC", "5")) {
+            while (c.moveToNext()) {
+                String o = c.getString(1);
+                // 只替换占位单号，不动已有真实单号
+                if (o != null && (o.startsWith("notify-") || o.startsWith("raw-"))) {
+                    id = c.getLong(0);
+                    break;
+                }
+            }
+        }
+        if (id < 0) return false;
+        ContentValues v = new ContentValues();
+        v.put(COL_ORDER, realOrder);
+        if (r.goodsName != null) v.put(COL_GOODS, r.goodsName);
+        if (r.memo != null) v.put(COL_MEMO, r.memo);
+        if (r.sender != null) v.put(COL_SENDER, r.sender);
+        if (r.feedesc != null) v.put(COL_FEEDESC, r.feedesc);
+        if (r.rawXml != null) v.put(COL_RAW, r.rawXml);
+        return db.update(TABLE, v, COL_ID + "=?", new String[]{String.valueOf(id)}) > 0;
+    }
+
     public List<PayRecord> all() {
         List<PayRecord> list = new ArrayList<>();
         SQLiteDatabase db = getReadableDatabase();

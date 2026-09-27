@@ -18,6 +18,7 @@ public class PayRecordProvider extends android.content.ContentProvider {
     public static final Uri URI = Uri.parse("content://" + AUTHORITY);
 
     public static final String METHOD_INSERT = "insert";
+    public static final String METHOD_INSERT_REAL = "insertReal";
     public static final String METHOD_QUERY = "query";
     public static final String METHOD_COUNT = "count";
     public static final String METHOD_CLEAR = "clear";
@@ -63,6 +64,21 @@ public class PayRecordProvider extends android.content.ContentProvider {
                 r.rawXml = extras.getString("rawXml");
                 long row = db.insert(r);
                 result.putBoolean("inserted", row != -1);
+                return result;
+            case METHOD_INSERT_REAL:
+                PayRecord rr = new PayRecord();
+                rr.orderNo = extras.getString("orderNo");
+                rr.amountCent = extras.getLong("amountCent");
+                rr.timeMillis = extras.getLong("timeMillis");
+                rr.paySubType = extras.getInt("paySubType");
+                rr.goodsName = extras.getString("goodsName");
+                rr.memo = extras.getString("memo");
+                rr.sender = extras.getString("sender");
+                rr.feedesc = extras.getString("feedesc");
+                rr.rawXml = extras.getString("rawXml");
+                long row2 = db.insertReal(rr);
+                result.putBoolean("inserted", row2 != -1);
+                result.putBoolean("merged", true); // 标记走对账合并流程
                 return result;
             case METHOD_COUNT:
                 result.putInt("count", db.all().size());
