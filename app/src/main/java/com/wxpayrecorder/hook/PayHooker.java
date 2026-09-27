@@ -85,8 +85,9 @@ public class PayHooker {
             for (Method m : appMsgClass.getDeclaredMethods()) {
                 if (m.getName().equals("v") && m.getParameterTypes().length == 1
                         && m.getParameterTypes()[0] == String.class) {
+                    // 参数类型逐个传入，不能包成数组
                     XposedHelpers.findAndHookMethod(appMsgClass, "v",
-                            new Class[]{String.class}, new XC_MethodHook() {
+                            String.class, new XC_MethodHook() {
                                 @Override
                                 protected void afterHookedMethod(MethodHookParam param) {
                                     hookQvOk = true;
