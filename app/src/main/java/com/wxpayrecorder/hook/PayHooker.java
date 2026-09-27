@@ -108,7 +108,7 @@ public class PayHooker {
 
     /** 是否为 wcpayinfo 支付卡片：含 paysubtype / feedesc 字段即可认为支付相关内容。 */
     private static boolean isWcPayInfo(Object q) {
-        return !isEmpty(get(q, "J0")) || get(q, "I0") != null;
+        return !isEmpty(str(get(q, "J0"))) || get(q, "I0") != null;
     }
 
     /** 仅记录"二维码收款"：feedesc 命中关键词（可配置）。 */
