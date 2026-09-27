@@ -39,6 +39,7 @@ public class PayHooker {
     private static volatile boolean hookZcL = false;
     private static volatile boolean hookAaD = false;
     private static volatile boolean hookMsgEntry = false;
+    private static volatile boolean hookI9A = false;
     private static volatile boolean hookNotify = false;
     private static volatile String hookInfo = "";
 
@@ -292,6 +293,26 @@ public class PayHooker {
             log("ww1.c2.b hook FAIL (ok to ignore): " + t);
         }
 
+        // 5b) Hook com.tencent.mm.ui.chatting.i9.a(f9) — 通知管理器处理新消息
+        //    ww1.b2.run() 把消息交给 i9(实现 c01/v8).a(f9) 处理，此时代码已 post 到
+        //    通知 looper，f9 的 content(U1) 一定已填充。比 ww1.c2.b 更靠后更可靠。
+        try {
+            Class<?> f9cls2 = XposedHelpers.findClass("com.tencent.mm.storage.f9", cl);
+            Class<?> i9cls = XposedHelpers.findClass("com.tencent.mm.ui.chatting.i9", cl);
+            XposedHelpers.findAndHookMethod(i9cls, "a", f9cls2, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    hookI9A = true;
+                    hookInfo = "i9.a(f9)";
+                    captureF9Message(param.args[0]);
+                }
+            });
+            hookI9A = true;
+            log("i9.a(f9) hooked");
+        } catch (Throwable t) {
+            log("i9.a hook FAIL (ok to ignore): " + t);
+        }
+
         // 6) HOOK NotificationManager.notify — Android 框架层通知，后台收到
         //    每条需要提示的新消息/收款都会走这里，是最可靠的真实触发点。
         try {
@@ -347,7 +368,7 @@ public class PayHooker {
             cachedMethodFound = "q.v=" + hookQvOk + " f9.S1=" + hookS1Ok
                     + " f9.j=" + hookJOk + " f9.U1=" + hookU1Ok + " zc.l=" + hookZcL
                     + " aa.d=" + hookAaD
-                    + " msgEntry=" + hookMsgEntry + " notify=" + hookNotify;
+                    + " msgEntry=" + hookMsgEntry + " i9.a=" + hookI9A + " notify=" + hookNotify;
         }
 
         // 如果 context 已可用就立即上报，否则等 Application.attach
@@ -538,9 +559,16 @@ public class PayHooker {
             } catch (Throwable ignore) {
             }
             String content = null;
+            // 优先 U1() —— 收款 appmsg 的完整 XML（含 wcpayinfo）在这个 getter
             try {
-                content = strOf(XposedHelpers.callMethod(f9, "j"));
+                content = strOf(XposedHelpers.callMethod(f9, "U1"));
             } catch (Throwable ignore) {
+            }
+            if (content == null) {
+                try {
+                    content = strOf(XposedHelpers.callMethod(f9, "j"));
+                } catch (Throwable ignore) {
+                }
             }
             if (content == null) {
                 try {
