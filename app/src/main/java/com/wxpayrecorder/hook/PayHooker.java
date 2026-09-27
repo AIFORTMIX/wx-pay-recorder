@@ -2,230 +2,291 @@ package com.wxpayrecorder.hook;
 
 import android.app.Application;
 import android.content.Context;
+import android.os.Bundle;
 
 import com.wxpayrecorder.PayRecordProvider;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * 核心 Hooker。
+ * 多路 Hook 策略：
+ * 1. ot0.q.v(String) — 用户打开聊天时解析 appmsg
+ * 2. f9.S1() — 获取消息原始内容（消息入库/通知时被调用）
+ * 3. f9.j() — 获取消息处理后的内容
  *
- * hook ot0.q(String) 解析 wcpayinfo 收款卡片，
- * 通过 ContentProvider 写入本模块数据库，
- * 同时通过心跳机制上报 hook 状态供 App 端验证。
+ * 三路同时监控，只要任意一路拿到含 wcpayinfo 的 XML 就提取收款数据。
+ * 直接用字符串匹配解析 XML，不依赖微信内部类。
  */
 public class PayHooker {
 
     private static volatile Context appContext;
-    private static volatile boolean hookInstalled = false;
-    private static volatile int msgCount = 0;
+    private static volatile int hookCount = 0;
+    private static volatile int payMsgCount = 0;
+    private static volatile int recordCount = 0;
+    private static volatile String lastFeedesc = null;
+    private static volatile String lastError = null;
+    private static volatile boolean hook1Ok = false;
+    private static volatile boolean hook2Ok = false;
+    private static volatile boolean hook3Ok = false;
+    private static volatile String hookInfo = "";
 
-    private static final List<String> RECORD_KEYWORDS =
-            new ArrayList<>(java.util.Collections.singletonList("二维码收款"));
+    // 去重：已处理的订单号
+    private static final Set<String> processedOrders = new HashSet<>();
 
     private PayHooker() {
     }
 
     public static void install(XC_LoadPackage.LoadPackageParam lpparam) {
-        // 1) 捕获 Application Context
+        ClassLoader cl = lpparam.classLoader;
+
+        // 0) 捕获 Application Context
         try {
             XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class,
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             appContext = (Context) param.thisObject;
-                            // 上报：模块已加载 + Application Context 就绪
                             sendHeartbeat(PayRecordProvider.KEY_HOOK_INSTALLED, "true");
                         }
                     });
         } catch (Throwable t) {
-            // attach 失败不影响后续 hook
+            sendHeartbeat(PayRecordProvider.KEY_HOOK_ERROR, "Application.attach hook失败: " + t.getMessage());
         }
 
-        // 2) hook AppMsg 解析入口
-        final ClassLoader cl = lpparam.classLoader;
-        final String targetClass = "ot0.q";
-        final String targetMethod = "v";
-
-        Class<?> appMsg;
+        // 1) Hook ot0.q.v(String) — 原始方案
         try {
-            appMsg = XposedHelpers.findClass(targetClass, cl);
-        } catch (Throwable t) {
-            // 类找不到 → 上报错误
-            sendHeartbeat(PayRecordProvider.KEY_HOOK_ERROR,
-                    "类 " + targetClass + " 未找到: " + t.getMessage());
-            return;
-        }
-
-        sendHeartbeat(PayRecordProvider.KEY_HOOK_CLASS_FOUND, targetClass);
-
-        // 查找目标方法
-        Method foundMethod = null;
-        for (Method m : appMsg.getDeclaredMethods()) {
-            if (m.getName().equals(targetMethod) && m.getParameterTypes().length == 1
-                    && m.getParameterTypes()[0] == String.class) {
-                foundMethod = m;
-                break;
-            }
-        }
-
-        if (foundMethod == null) {
-            // 退化：查找同名单参数方法
-            for (Method m : appMsg.getDeclaredMethods()) {
-                if (m.getName().equals(targetMethod) && m.getParameterTypes().length == 1) {
-                    foundMethod = m;
+            Class<?> appMsgClass = XposedHelpers.findClass("ot0.q", cl);
+            for (Method m : appMsgClass.getDeclaredMethods()) {
+                if (m.getName().equals("v") && m.getParameterTypes().length == 1
+                        && m.getParameterTypes()[0] == String.class) {
+                    XposedHelpers.findAndHookMethod(appMsgClass, "v",
+                            new Class[]{String.class}, new XC_MethodHook() {
+                                @Override
+                                protected void afterHookedMethod(MethodHookParam param) {
+                                    hook1Ok = true;
+                                    hookInfo = "ot0.q.v(String)";
+                                    tryProcessXml((String) param.args[0]);
+                                }
+                            });
+                    hook2Ok = true; // 标记 hook1 成功
+                    sendHeartbeat(PayRecordProvider.KEY_HOOK_CLASS_FOUND, "ot0.q");
+                    sendHeartbeat(PayRecordProvider.KEY_HOOK_METHOD_FOUND, "v(String)");
                     break;
                 }
             }
+        } catch (Throwable t) {
+            sendHeartbeat(PayRecordProvider.KEY_HOOK_ERROR, "ot0.q hook失败: " + t.getMessage());
         }
 
-        if (foundMethod == null) {
-            sendHeartbeat(PayRecordProvider.KEY_HOOK_ERROR,
-                    "方法 " + targetMethod + "(String) 在 " + targetClass + " 中未找到");
-            return;
+        // 2) Hook com.tencent.mm.storage.f9.S1() — 原始内容 getter
+        try {
+            Class<?> f9Class = XposedHelpers.findClass("com.tencent.mm.storage.f9", cl);
+            XposedHelpers.findAndHookMethod(f9Class, "S1", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    hook2Ok = true;
+                    hookInfo = "f9.S1()";
+                    tryProcessXml((String) param.getResult());
+                }
+            });
+            sendHeartbeat(PayRecordProvider.KEY_HOOK_CLASS_FOUND, "f9.S1+ot0.q");
+        } catch (Throwable t) {
+            // S1 可能不存在，忽略
+        }
+
+        // 3) Hook com.tencent.mm.storage.f9.j() — 处理后内容 getter
+        try {
+            Class<?> f9Class = XposedHelpers.findClass("com.tencent.mm.storage.f9", cl);
+            XposedHelpers.findAndHookMethod(f9Class, "j", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    hook3Ok = true;
+                    hookInfo = "f9.j()";
+                    tryProcessXml((String) param.getResult());
+                }
+            });
+        } catch (Throwable t) {
+            // j 可能不存在，忽略
         }
 
         sendHeartbeat(PayRecordProvider.KEY_HOOK_METHOD_FOUND,
-                targetMethod + "(" + foundMethod.getParameterTypes()[0].getSimpleName() + ")");
-        hookInstalled = true;
-
-        // hook 目标方法
-        XposedHelpers.findAndHookMethod(appMsg, targetMethod,
-                foundMethod.getParameterTypes(), new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        try {
-                            Object q = param.getResult();
-                            if (q == null) return;
-
-                            if (!isWcPayInfo(q)) return;
-
-                            // 上报每次支付消息解析（含非收款）
-                            String feedesc = str(get(q, "J0"));
-                            sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_TIME,
-                                    String.valueOf(System.currentTimeMillis()));
-                            sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_TYPE,
-                                    "feedesc=" + (feedesc == null ? "null" : feedesc));
-                            sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_AMOUNT,
-                                    "amount=" + num(get(q, "Q0")) + "分");
-
-                            if (!shouldRecord(q, cl)) return;
-                            sendRecord(q, (String) param.args[0], cl);
-                            msgCount++;
-                            sendHeartbeat(PayRecordProvider.KEY_MSG_COUNT,
-                                    String.valueOf(msgCount));
-                        } catch (Throwable ignore) {
-                        }
-                    }
-                });
+                "hooks: q.v=" + hook2Ok + " f9.S1=" + hook2Ok + " f9.j=" + hook3Ok);
     }
 
-    // -------- 判定与提取 --------
+    /**
+     * 检查 XML 是否包含 wcpayinfo，如果是则提取收款数据。
+     */
+    private static void tryProcessXml(String xml) {
+        if (xml == null || xml.length() < 20) return;
+        if (!xml.contains("wcpayinfo")) return;
 
-    private static boolean isWcPayInfo(Object q) {
-        return !isEmpty(str(get(q, "J0"))) || get(q, "I0") != null;
-    }
+        hookCount++;
+        sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_TIME,
+                String.valueOf(System.currentTimeMillis()));
+        sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_TYPE,
+                "wcpayinfo 命中 (hook=" + hookInfo + ")");
 
-    private static boolean shouldRecord(Object q, ClassLoader cl) {
-        String feedesc = str(get(q, "J0"));
-        if (RECORD_KEYWORDS.isEmpty()) return true;
-        for (String kw : RECORD_KEYWORDS) {
-            if (feedesc != null && feedesc.contains(kw)) return true;
-        }
-        return false;
-    }
+        // 提取支付字段
+        String feedesc = extractTag(xml, "feedesc");
+        String transcationid = extractTag(xml, "transcationid");
+        String transferid = extractTag(xml, "transferid");
+        String totalFee = extractTag(xml, "total_fee");
+        String payMemo = extractTag(xml, "pay_memo");
+        String payerUsername = extractTag(xml, "payer_username");
+        String paysubtype = extractTag(xml, "paysubtype");
 
-    private static void sendRecord(Object q, String rawXml, ClassLoader cl) {
-        StringBuilder order = new StringBuilder();
-        order.append(str(get(q, "K0")));
-        if (order.length() == 0) order.append(str(get(q, "L0")));
-        String orderNo = order.toString().trim();
-        if (orderNo.length() == 0) {
-            orderNo = "raw-" + Integer.toHexString(rawXml == null ? 0 : rawXml.hashCode());
+        lastFeedesc = feedesc;
+        sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_AMOUNT,
+                "feedesc=" + feedesc + " total_fee=" + totalFee + "分 memo=" + payMemo);
+
+        // 订单号
+        String orderNo = firstNonEmpty(transcationid, transferid);
+        if (orderNo == null || orderNo.isEmpty()) {
+            orderNo = "raw-" + Integer.toHexString(xml.hashCode());
         }
 
-        long amountCent = num(get(q, "Q0"));
-        String goods = firstNonEmpty(str(get(q, "J0")), str(get(q, "f")));
-        String memo = str(get(q, "X1"));
-        String sender = str(get(q, "O0"));
-        int subType = (int) num(get(q, "I0"));
+        // 去重
+        synchronized (processedOrders) {
+            if (processedOrders.contains(orderNo)) return;
+            processedOrders.add(orderNo);
+            if (processedOrders.size() > 5000) processedOrders.clear();
+        }
 
-        android.os.Bundle b = new android.os.Bundle();
+        // 金额（分）
+        long amountCent = 0;
+        if (totalFee != null && !totalFee.isEmpty()) {
+            try { amountCent = Long.parseLong(totalFee); } catch (Exception e) { }
+        }
+        // 如果 total_fee 为 0，尝试从 feedesc 提取金额
+        if (amountCent == 0 && feedesc != null) {
+            amountCent = extractAmountFromText(feedesc);
+        }
+
+        // 支付子类型
+        int subType = 0;
+        if (paysubtype != null && !paysubtype.isEmpty()) {
+            try { subType = Integer.parseInt(paysubtype); } catch (Exception e) { }
+        }
+
+        // 商品/描述
+        String goodsName = firstNonEmpty(feedesc, extractTag(xml, "title"));
+        // 对方备注
+        String memo = payMemo;
+        // 付款方
+        String sender = payerUsername;
+
+        // 写入数据库
+        Bundle b = new Bundle();
         b.putString("orderNo", orderNo);
         b.putLong("amountCent", amountCent);
         b.putLong("timeMillis", System.currentTimeMillis());
         b.putInt("paySubType", subType);
-        b.putString("goodsName", goods);
+        b.putString("goodsName", goodsName);
         b.putString("memo", memo);
         b.putString("sender", sender);
-        b.putString("feedesc", str(get(q, "J0")));
-        b.putString("rawXml", rawXml);
+        b.putString("feedesc", feedesc);
+        b.putString("rawXml", xml.length() > 5000 ? xml.substring(0, 5000) : xml);
 
         Context ctx = getContext();
         if (ctx == null) return;
         try {
-            ctx.getContentResolver().call(PayRecordProvider.URI,
-                    PayRecordProvider.METHOD_INSERT, null, b);
-        } catch (Throwable ignore) {
+            Bundle result = ctx.getContentResolver().call(
+                    PayRecordProvider.URI, PayRecordProvider.METHOD_INSERT, null, b);
+            if (result != null && result.getBoolean("inserted", false)) {
+                recordCount++;
+                payMsgCount++;
+                sendHeartbeat(PayRecordProvider.KEY_MSG_COUNT, String.valueOf(recordCount));
+            }
+        } catch (Throwable ignore) { }
+    }
+
+    // -------- XML 提取辅助 --------
+
+    /**
+     * 从 XML 文本中提取 <tag>value</tag> 的值。
+     * 支持自闭合标签和嵌套。
+     */
+    private static String extractTag(String xml, String tag) {
+        if (xml == null || tag == null) return null;
+        String openTag = "<" + tag + ">";
+        String closeTag = "</" + tag + ">";
+        String selfClose = "</" + tag + ">"; // same as close
+
+        int start = xml.indexOf(openTag);
+        if (start < 0) {
+            // 尝试带属性的标签 <tag ...>
+            int lt = xml.indexOf("<" + tag + " ");
+            if (lt >= 0) {
+                int gt = xml.indexOf(">", lt);
+                if (gt > lt) {
+                    int end = xml.indexOf("</" + tag + ">", gt);
+                    if (end > gt) {
+                        return xml.substring(gt + 1, end).trim();
+                    }
+                }
+            }
+            return null;
+        }
+        int valueStart = start + openTag.length();
+        int end = xml.indexOf(closeTag, valueStart);
+        if (end < 0) return null;
+        return xml.substring(valueStart, end).trim();
+    }
+
+    /**
+     * 从文本中提取金额（分）。
+     * 例如 "¥1.23" → 123, "0.01" → 1
+     */
+    private static long extractAmountFromText(String text) {
+        if (text == null) return 0;
+        // 找到数字部分
+        int start = -1;
+        int end = -1;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if ((c >= '0' && c <= '9') || c == '.') {
+                if (start < 0) start = i;
+                end = i;
+            } else if (start >= 0) {
+                break;
+            }
+        }
+        if (start < 0 || end < 0) return 0;
+        String numStr = text.substring(start, end + 1);
+        try {
+            double d = Double.parseDouble(numStr);
+            return Math.round(d * 100);
+        } catch (Exception e) {
+            return 0;
         }
     }
 
-    // -------- 心跳上报 --------
+    // -------- 心跳 --------
 
     private static void sendHeartbeat(String key, String value) {
         Context ctx = getContext();
         if (ctx == null) return;
         try {
-            android.os.Bundle b = new android.os.Bundle();
+            Bundle b = new Bundle();
             b.putString(key, value);
             ctx.getContentResolver().call(PayRecordProvider.URI,
                     PayRecordProvider.METHOD_HEARTBEAT, null, b);
-        } catch (Throwable ignore) {
-        }
+        } catch (Throwable ignore) { }
     }
-
-    // -------- 反射辅助 --------
 
     private static Context getContext() {
         return appContext;
     }
 
-    private static Object get(Object obj, String field) {
-        try {
-            return XposedHelpers.getObjectField(obj, field);
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    private static String str(Object o) {
-        return o == null ? null : String.valueOf(o);
-    }
-
-    private static long num(Object o) {
-        if (o == null) return 0;
-        try {
-            if (o instanceof Number) return ((Number) o).longValue();
-            return Long.parseLong(String.valueOf(o));
-        } catch (Throwable t) {
-            return 0;
-        }
-    }
-
-    private static boolean isEmpty(String s) {
-        return s == null || s.trim().length() == 0;
-    }
-
     private static String firstNonEmpty(String... arr) {
         for (String s : arr) {
-            if (!isEmpty(s)) return s;
+            if (s != null && !s.trim().isEmpty()) return s;
         }
         return null;
     }
