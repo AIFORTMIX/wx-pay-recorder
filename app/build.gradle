@@ -25,8 +25,12 @@ android {
     }
 }
 
+repositories {
+    // Xposed Framework 官方仓库
+    maven { url 'https://api.xposed.info/' }
+}
+
 dependencies {
     // Xposed API：只用于编译（compileOnly），运行时由 LSPosed 提供
     compileOnly 'de.robv.android.xposed:api:82'
-    compileOnly 'de.robv.android.xposed:api:82:sources'
 }
