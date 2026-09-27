@@ -242,11 +242,15 @@ public class PayHooker {
                                         }
                                         sb.append("title=").append(t).append("\n");
                                         sb.append("text=").append(txt).append("\n");
-                                        // 从通知文案中识别金额（收款到账提示常含金额）
-                                        String all = (t == null ? "" : t) + (txt == null ? "" : txt);
+                                        // 从通知文案中识别金额并直接记录收款（收款到账提示含明确金额）
+                                        String all = (t == null ? "" : t) + " " + (txt == null ? "" : txt);
                                         java.util.regex.Matcher m = amountPat.matcher(all);
                                         if (m.find()) {
                                             sb.append("APPARENT_AMOUNT=").append(m.group()).append("\n");
+                                            try {
+                                                recordFromNotify(t, txt, m.group(), all);
+                                            } catch (Throwable ignore) {
+                                            }
                                         }
                                     } catch (Throwable ignore) {
                                     }
@@ -275,7 +279,95 @@ public class PayHooker {
     }
 
     private static final java.util.regex.Pattern amountPat =
-            java.util.regex.Pattern.compile("[¥￥]\\s?\\d{1,3}(:?[.,]\\d{1,2})?\\b");
+            java.util.regex.Pattern.compile("[¥￥]\\s?\\d{1,3}(?:[.,]\\d{1,2})?\\b|收款\\s?(\\d+(?:[,.]\\d{1,2})?)\\s?元");
+
+    /**
+     * 直接从通知栏文案解析并记录收款。
+     * 收款到账通知文本示例：title=微信收款助手  text=微信支付收款0.01元(朋友到店)
+     */
+    private static void recordFromNotify(String title, String text, String matchedAmount, String all) {
+        if (text == null) text = "";
+        // 仅处理"收款"相关通知（二维码收款/朋友到店等收款到账）
+        if (!text.contains("收款") && !text.contains("到账")) return;
+        if (all == null) all = title + " " + text;
+
+        // 金额：优先匹配"收款0.01元"格式
+        long amountCent = 0;
+        java.util.regex.Matcher m2 = java.util.regex.Pattern
+                .compile("收款\\s?(\\d+(?:[,.]\\d{1,2})?)\\s?元").matcher(text);
+        String amountStr = null;
+        if (m2.find()) {
+            amountStr = m2.group(1);
+        } else {
+            java.util.regex.Matcher m = amountPat.matcher(all);
+            if (m.find()) {
+                amountStr = m.group().replaceAll("[¥￥元\\s]", "");
+            }
+        }
+        if (amountStr == null) return;
+        try {
+            amountStr = amountStr.replace(",", ".");
+            String[] parts = amountStr.split("\\.");
+            long yuan = Long.parseLong(parts[0]);
+            long fen = 0;
+            if (parts.length > 1 && !parts[1].isEmpty()) {
+                if (parts[1].length() == 1) fen = Long.parseLong(parts[1]) * 10;
+                else if (parts[1].length() >= 2) fen = Long.parseLong(parts[1].substring(0, 2));
+            }
+            amountCent = yuan * 100 + fen;
+        } catch (Exception e) {
+            return; // 金额解析失败，放弃
+        }
+        if (amountCent <= 0) return;
+
+        // 备注/商品名：括号内的内容，如"朋友到店"
+        String remark = "";
+        java.util.regex.Matcher br = java.util.regex.Pattern
+                .compile("\\((.*?)\\)|（(.*?)）").matcher(text);
+        if (br.find()) {
+            remark = br.group(1) != null ? br.group(1).trim() : br.group(2).trim();
+        }
+        String goodsName = text.replaceAll("微信支付收款\\s?\\d[.,]?\\d{0,2}\\s?元", "")
+                .replaceAll("[\\(\\)（）]", "").trim();
+        if (goodsName.isEmpty()) goodsName = "收款";
+
+        // 订单号：通知里没有，用时间戳生成（同一毫秒去重可接受）
+        String orderNo = "notify-" + System.currentTimeMillis();
+
+        // 去重
+        synchronized (processedOrders) {
+            if (processedOrders.contains(orderNo)) return;
+            processedOrders.add(orderNo);
+            if (processedOrders.size() > 5000) processedOrders.clear();
+        }
+
+        // 写入数据库
+        Bundle b = new Bundle();
+        b.putString("orderNo", orderNo);
+        b.putLong("amountCent", amountCent);
+        b.putLong("timeMillis", System.currentTimeMillis());
+        b.putInt("paySubType", 1); // 1=收款到账
+        b.putString("goodsName", goodsName);
+        b.putString("memo", remark);
+        b.putString("sender", title == null ? "微信收款助手" : title);
+        b.putString("feedesc", text);
+        b.putString("rawXml", "[notification] " + text);
+
+        Context ctx = getContext();
+        if (ctx == null) return;
+        try {
+            Bundle result = ctx.getContentResolver().call(
+                    PayRecordProvider.URI, PayRecordProvider.METHOD_INSERT, null, b);
+            boolean inserted = result != null && result.getBoolean("inserted", false);
+            log("notify insert orderNo=" + orderNo + " amount=" + amountCent
+                    + " goods=" + goodsName + " inserted=" + inserted);
+            if (inserted) {
+                recordCount++;
+                payMsgCount++;
+                sendHeartbeat(PayRecordProvider.KEY_MSG_COUNT, String.valueOf(recordCount));
+            }
+        } catch (Throwable ignore) { }
+    }
 
     /**
      * 从消息对象 f9 中提取 talker/type/内容，写入调试消息流。
