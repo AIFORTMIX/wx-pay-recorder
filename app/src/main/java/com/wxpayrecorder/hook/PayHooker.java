@@ -11,6 +11,7 @@ import java.util.HashSet;
 import java.util.Set;
 
 import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
@@ -31,15 +32,28 @@ public class PayHooker {
     private static volatile int recordCount = 0;
     private static volatile String lastFeedesc = null;
     private static volatile String lastError = null;
-    private static volatile boolean hook1Ok = false;
-    private static volatile boolean hook2Ok = false;
-    private static volatile boolean hook3Ok = false;
+    private static volatile boolean hookQvOk = false;
+    private static volatile boolean hookS1Ok = false;
+    private static volatile boolean hookJOk = false;
     private static volatile String hookInfo = "";
+
+    // 缓存的状态，等拿到 context 后统一上报
+    private static volatile String cachedClassFound = null;
+    private static volatile String cachedMethodFound = null;
+    private static volatile String cachedError = null;
+    private static volatile boolean statusFlushed = false;
 
     // 去重：已处理的订单号
     private static final Set<String> processedOrders = new HashSet<>();
 
     private PayHooker() {
+    }
+
+    private static void log(String msg) {
+        try {
+            XposedBridge.log("[WxPayRecorder] " + msg);
+        } catch (Throwable ignore) {
+        }
     }
 
     public static void install(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -52,16 +66,22 @@ public class PayHooker {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             appContext = (Context) param.thisObject;
+                            log("Application.attach fired, context=" + appContext);
+                            // 先上报激活，再把缓存的 hook 状态冲出去
                             sendHeartbeat(PayRecordProvider.KEY_HOOK_INSTALLED, "true");
+                            flushBufferedStatus();
                         }
                     });
+            log("Application.attach hook ok");
         } catch (Throwable t) {
-            sendHeartbeat(PayRecordProvider.KEY_HOOK_ERROR, "Application.attach hook失败: " + t.getMessage());
+            log("Application.attach hook FAIL: " + t);
+            cachedError = "Application.attach hook失败: " + t.getMessage();
         }
 
         // 1) Hook ot0.q.v(String) — 原始方案
         try {
             Class<?> appMsgClass = XposedHelpers.findClass("ot0.q", cl);
+            boolean found = false;
             for (Method m : appMsgClass.getDeclaredMethods()) {
                 if (m.getName().equals("v") && m.getParameterTypes().length == 1
                         && m.getParameterTypes()[0] == String.class) {
@@ -69,19 +89,26 @@ public class PayHooker {
                             new Class[]{String.class}, new XC_MethodHook() {
                                 @Override
                                 protected void afterHookedMethod(MethodHookParam param) {
-                                    hook1Ok = true;
+                                    hookQvOk = true;
                                     hookInfo = "ot0.q.v(String)";
                                     tryProcessXml((String) param.args[0]);
                                 }
                             });
-                    hook2Ok = true; // 标记 hook1 成功
-                    sendHeartbeat(PayRecordProvider.KEY_HOOK_CLASS_FOUND, "ot0.q");
-                    sendHeartbeat(PayRecordProvider.KEY_HOOK_METHOD_FOUND, "v(String)");
+                    found = true;
                     break;
                 }
             }
+            if (found) {
+                cachedClassFound = "ot0.q";
+                cachedMethodFound = "v(String)";
+                log("ot0.q.v(String) hooked");
+            } else {
+                cachedError = "ot0.q 存在但未找到 v(String) 方法";
+                log("ot0.q found but v(String) not found");
+            }
         } catch (Throwable t) {
-            sendHeartbeat(PayRecordProvider.KEY_HOOK_ERROR, "ot0.q hook失败: " + t.getMessage());
+            log("ot0.q hook FAIL: " + t);
+            cachedError = "ot0.q hook失败: " + t.getMessage();
         }
 
         // 2) Hook com.tencent.mm.storage.f9.S1() — 原始内容 getter
@@ -90,14 +117,15 @@ public class PayHooker {
             XposedHelpers.findAndHookMethod(f9Class, "S1", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    hook2Ok = true;
+                    hookS1Ok = true;
                     hookInfo = "f9.S1()";
                     tryProcessXml((String) param.getResult());
                 }
             });
-            sendHeartbeat(PayRecordProvider.KEY_HOOK_CLASS_FOUND, "f9.S1+ot0.q");
+            hookS1Ok = true;
+            log("f9.S1() hooked");
         } catch (Throwable t) {
-            // S1 可能不存在，忽略
+            log("f9.S1 hook FAIL (ok to ignore): " + t);
         }
 
         // 3) Hook com.tencent.mm.storage.f9.j() — 处理后内容 getter
@@ -106,17 +134,43 @@ public class PayHooker {
             XposedHelpers.findAndHookMethod(f9Class, "j", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    hook3Ok = true;
+                    hookJOk = true;
                     hookInfo = "f9.j()";
                     tryProcessXml((String) param.getResult());
                 }
             });
+            hookJOk = true;
+            log("f9.j() hooked");
         } catch (Throwable t) {
-            // j 可能不存在，忽略
+            log("f9.j hook FAIL (ok to ignore): " + t);
         }
 
-        sendHeartbeat(PayRecordProvider.KEY_HOOK_METHOD_FOUND,
-                "hooks: q.v=" + hook2Ok + " f9.S1=" + hook2Ok + " f9.j=" + hook3Ok);
+        // 汇总 hook 状态（如果有更详细的信息则覆盖）
+        if (cachedError == null) {
+            cachedClassFound = "ot0.q";
+            cachedMethodFound = "q.v=" + hookQvOk + " f9.S1=" + hookS1Ok + " f9.j=" + hookJOk;
+        }
+
+        // 如果 context 已可用就立即上报，否则等 Application.attach
+        flushBufferedStatus();
+    }
+
+    /**
+     * 把缓存的 hook 状态上报到 ContentProvider。
+     * 只有拿到 appContext 后才会真正发送。
+     */
+    private static void flushBufferedStatus() {
+        if (appContext == null) return;
+        if (statusFlushed) return;
+        statusFlushed = true;
+        if (cachedError != null) {
+            sendHeartbeat(PayRecordProvider.KEY_HOOK_ERROR, cachedError);
+        } else {
+            if (cachedClassFound != null)
+                sendHeartbeat(PayRecordProvider.KEY_HOOK_CLASS_FOUND, cachedClassFound);
+            if (cachedMethodFound != null)
+                sendHeartbeat(PayRecordProvider.KEY_HOOK_METHOD_FOUND, cachedMethodFound);
+        }
     }
 
     /**
@@ -127,6 +181,7 @@ public class PayHooker {
         if (!xml.contains("wcpayinfo")) return;
 
         hookCount++;
+        log("wcpayinfo hit via " + hookInfo + ", xml len=" + xml.length());
         sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_TIME,
                 String.valueOf(System.currentTimeMillis()));
         sendHeartbeat(PayRecordProvider.KEY_LAST_MSG_TYPE,
@@ -198,7 +253,9 @@ public class PayHooker {
         try {
             Bundle result = ctx.getContentResolver().call(
                     PayRecordProvider.URI, PayRecordProvider.METHOD_INSERT, null, b);
-            if (result != null && result.getBoolean("inserted", false)) {
+            boolean inserted = result != null && result.getBoolean("inserted", false);
+            log("insert orderNo=" + orderNo + " amount=" + amountCent + " inserted=" + inserted);
+            if (inserted) {
                 recordCount++;
                 payMsgCount++;
                 sendHeartbeat(PayRecordProvider.KEY_MSG_COUNT, String.valueOf(recordCount));
