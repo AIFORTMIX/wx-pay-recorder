@@ -35,6 +35,7 @@ public class PayHooker {
     private static volatile boolean hookQvOk = false;
     private static volatile boolean hookS1Ok = false;
     private static volatile boolean hookJOk = false;
+    private static volatile boolean hookAaD = false;
     private static volatile String hookInfo = "";
 
     // 缓存的状态，等拿到 context 后统一上报
@@ -146,10 +147,57 @@ public class PayHooker {
             log("f9.j hook FAIL (ok to ignore): " + t);
         }
 
+        // 4) Hook com.tencent.mm.sdk.platformtools.aa.d(...) — 底层 XML 解析器
+        //    这是微信解析任何消息 XML 的必经静态方法。遍历所有名为 d 的方法，
+        //    只要参数里有 String（XML），回调时就检查是否含 wcpayinfo。
+        try {
+            Class<?> aaClass = XposedHelpers.findClass("com.tencent.mm.sdk.platformtools.aa", cl);
+            int aaHooked = 0;
+            for (Method m : aaClass.getDeclaredMethods()) {
+                if (!m.getName().equals("d")) continue;
+                boolean hasStringParam = false;
+                for (Class<?> pt : m.getParameterTypes()) {
+                    if (pt == String.class) { hasStringParam = true; break; }
+                }
+                if (!hasStringParam) continue;
+                try {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            hookAaD = true;
+                            hookInfo = "aa.d(all)";
+                            // 检查所有 String 参数
+                            for (Object o : param.args) {
+                                if (o instanceof String && ((String) o).contains("wcpayinfo")) {
+                                    tryProcessXml((String) o);
+                                }
+                            }
+                            // 也检查返回值（有的重载返回解析后的 Map）
+                            Object r = param.getResult();
+                            if (r instanceof String && ((String) r).contains("wcpayinfo")) {
+                                tryProcessXml((String) r);
+                            }
+                        }
+                    });
+                    aaHooked++;
+                } catch (Throwable ignore) {
+                }
+            }
+            if (aaHooked > 0) {
+                hookAaD = true;
+                log("aa.d hooked, " + aaHooked + " overloads");
+            } else {
+                log("aa.d: no d(String) method found");
+            }
+        } catch (Throwable t) {
+            log("aa.d hook FAIL: " + t);
+        }
+
         // 汇总 hook 状态（如果有更详细的信息则覆盖）
         if (cachedError == null) {
             cachedClassFound = "ot0.q";
-            cachedMethodFound = "q.v=" + hookQvOk + " f9.S1=" + hookS1Ok + " f9.j=" + hookJOk;
+            cachedMethodFound = "q.v=" + hookQvOk + " f9.S1=" + hookS1Ok
+                    + " f9.j=" + hookJOk + " aa.d=" + hookAaD;
         }
 
         // 如果 context 已可用就立即上报，否则等 Application.attach
