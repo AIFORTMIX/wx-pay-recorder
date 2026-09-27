@@ -10,6 +10,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      KEYSTORE_PASSWORD: wxpay2026
+      KEY_ALIAS: release
+      KEY_PASSWORD: wxpay2026
+
     steps:
       - uses: actions/checkout@v4
 
@@ -28,23 +33,19 @@ jobs:
       - name: Generate signing keystore
         run: |
           keytool -genkeypair -v \
-            -keystore $HOME/release.keystore \
+            -keystore "$HOME/release.keystore" \
             -alias release \
             -keyalg RSA -keysize 2048 \
             -validity 10000 \
-            -storepass wxpay2026 \
-            -keypass wxpay2026 \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -keypass "$KEY_PASSWORD" \
             -dname "CN=wx-pay-recorder, OU=dev, O=wxpayrecorder, L=CN, ST=CN, C=CN"
+          echo "KEYSTORE_FILE=$HOME/release.keystore" >> "$GITHUB_ENV"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
       - name: Build signed release APK
-        env:
-          KEYSTORE_FILE: ${{ env.HOME }}/release.keystore
-          KEYSTORE_PASSWORD: wxpay2026
-          KEY_ALIAS: release
-          KEY_PASSWORD: wxpay2026
         run: gradle --no-daemon :app:assembleRelease
 
       - name: Upload APK
