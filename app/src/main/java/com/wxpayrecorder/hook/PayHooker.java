@@ -36,7 +36,11 @@ public class PayHooker {
     private static volatile boolean hookS1Ok = false;
     private static volatile boolean hookJOk = false;
     private static volatile boolean hookAaD = false;
+    private static volatile boolean hookMsgEntry = false;
     private static volatile String hookInfo = "";
+
+    // 缓存调试消息，等 appContext 就绪后补发
+    private static final java.util.List<String[]> pendingDebug = new java.util.ArrayList<>();
 
     // 缓存的状态，等拿到 context 后统一上报
     private static volatile String cachedClassFound = null;
@@ -193,15 +197,97 @@ public class PayHooker {
             log("aa.d hook FAIL: " + t);
         }
 
+        // 5) HOOK 消息接收入口 ww1.c2.b(f9, j4) — 捕获所有新到消息
+        try {
+            Class<?> f9cls = XposedHelpers.findClass("com.tencent.mm.storage.f9", cl);
+            Class<?> j4cls = XposedHelpers.findClass("r45.j4", cl);
+            Class<?> c2cls = XposedHelpers.findClass("ww1.c2", cl);
+            XposedHelpers.findAndHookMethod(c2cls, "b", f9cls, j4cls, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    hookMsgEntry = true;
+                    hookInfo = "ww1.c2.b(f9,j4)";
+                    captureF9Message(param.args[0]);
+                }
+            });
+            hookMsgEntry = true;
+            log("ww1.c2.b(f9,j4) hooked");
+        } catch (Throwable t) {
+            log("ww1.c2.b hook FAIL (ok to ignore): " + t);
+        }
+
         // 汇总 hook 状态（如果有更详细的信息则覆盖）
         if (cachedError == null) {
             cachedClassFound = "ot0.q";
             cachedMethodFound = "q.v=" + hookQvOk + " f9.S1=" + hookS1Ok
-                    + " f9.j=" + hookJOk + " aa.d=" + hookAaD;
+                    + " f9.j=" + hookJOk + " aa.d=" + hookAaD
+                    + " msgEntry=" + hookMsgEntry;
         }
 
         // 如果 context 已可用就立即上报，否则等 Application.attach
         flushBufferedStatus();
+    }
+
+    /**
+     * 从消息对象 f9 中提取 talker/type/内容，写入调试消息流。
+     */
+    private static void captureF9Message(Object f9) {
+        if (f9 == null) return;
+        try {
+            String talker = strOf(XposedHelpers.callMethod(f9, "Q0"));
+            int type = 0;
+            try {
+                type = ((Integer) XposedHelpers.callMethod(f9, "getType"));
+            } catch (Throwable ignore) {
+            }
+            String content = null;
+            try {
+                content = strOf(XposedHelpers.callMethod(f9, "j"));
+            } catch (Throwable ignore) {
+            }
+            if (content == null) {
+                try {
+                    content = strOf(XposedHelpers.callMethod(f9, "S1"));
+                } catch (Throwable ignore) {
+                }
+            }
+            if (content != null && content.contains("wcpayinfo")) {
+                tryProcessXml(content);
+            }
+            String summary = content;
+            if (summary != null && summary.length() > 300) {
+                summary = summary.substring(0, 300);
+            }
+            sendDebugMsg(talker, String.valueOf(type), summary);
+        } catch (Throwable t) {
+            log("captureF9Message FAIL: " + t);
+        }
+    }
+
+    private static String strOf(Object o) {
+        return o == null ? null : String.valueOf(o);
+    }
+
+    private static void sendDebugMsg(String talker, String type, String summary) {
+        Context ctx = getContext();
+        if (ctx == null) {
+            // 缓冲到 pendingDebug 里，等 context 就绪再发
+            synchronized (pendingDebug) {
+                String[] s = new String[]{talker == null ? "" : talker,
+                        type == null ? "" : type, summary == null ? "" : summary};
+                if (pendingDebug.size() < 200) pendingDebug.add(s);
+            }
+            return;
+        }
+        try {
+            Bundle b = new Bundle();
+            b.putString("talker", talker);
+            b.putString("type", type);
+            b.putString("summary", summary);
+            ctx.getContentResolver().call(PayRecordProvider.URI,
+                    PayRecordProvider.METHOD_LOG_MSG, null, b);
+        } catch (Throwable ignore) {
+        }
     }
 
     /**
@@ -219,6 +305,15 @@ public class PayHooker {
                 sendHeartbeat(PayRecordProvider.KEY_HOOK_CLASS_FOUND, cachedClassFound);
             if (cachedMethodFound != null)
                 sendHeartbeat(PayRecordProvider.KEY_HOOK_METHOD_FOUND, cachedMethodFound);
+        }
+        // 补发排队中的调试消息
+        java.util.List<String[]> copy;
+        synchronized (pendingDebug) {
+            copy = new java.util.ArrayList<>(pendingDebug);
+            pendingDebug.clear();
+        }
+        for (String[] s : copy) {
+            sendDebugMsg(s[0], s[1], s[2]);
         }
     }
 

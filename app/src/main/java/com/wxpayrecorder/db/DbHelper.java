@@ -19,7 +19,7 @@ import java.util.List;
 public class DbHelper extends SQLiteOpenHelper {
 
     public static final String DB = "records.db";
-    public static final int VERSION = 3;
+    public static final int VERSION = 4;
 
     public static final String TABLE = "pay_record";
     public static final String COL_ID = "_id";
@@ -32,6 +32,14 @@ public class DbHelper extends SQLiteOpenHelper {
     public static final String COL_SENDER = "sender";
     public static final String COL_FEEDESC = "feedesc";
     public static final String COL_RAW = "raw_xml";
+
+    // debug_msg 表
+    public static final String TABLE_DEBUG = "debug_msg";
+    public static final String COL_D_ID = "_id";
+    public static final String COL_D_TIME = "time_millis";
+    public static final String COL_D_TALKER = "talker";
+    public static final String COL_D_TYPE = "type_str";
+    public static final String COL_D_SUMMARY = "summary";
 
     // hook_status 表
     public static final String TABLE_STATUS = "hook_status";
@@ -62,6 +70,17 @@ public class DbHelper extends SQLiteOpenHelper {
                 + COL_S_VALUE + " TEXT,"
                 + COL_S_TIME + " INTEGER DEFAULT 0"
                 + ")");
+        db.execSQL(createDebugSql());
+    }
+
+    private static String createDebugSql() {
+        return "CREATE TABLE IF NOT EXISTS " + TABLE_DEBUG + " ("
+                + COL_D_ID + " INTEGER PRIMARY KEY AUTOINCREMENT,"
+                + COL_D_TIME + " INTEGER NOT NULL,"
+                + COL_D_TALKER + " TEXT,"
+                + COL_D_TYPE + " TEXT,"
+                + COL_D_SUMMARY + " TEXT"
+                + ")";
     }
 
     @Override
@@ -78,6 +97,9 @@ public class DbHelper extends SQLiteOpenHelper {
                     + COL_S_VALUE + " TEXT,"
                     + COL_S_TIME + " INTEGER DEFAULT 0"
                     + ")");
+        }
+        if (oldV < 4) {
+            db.execSQL(createDebugSql());
         }
     }
 
@@ -164,5 +186,55 @@ public class DbHelper extends SQLiteOpenHelper {
             if (c.moveToFirst()) return c.getLong(0);
         }
         return 0;
+    }
+
+    // -------- 调试消息流 --------
+
+    public void insertDebug(String talker, String type, String summary) {
+        if (summary == null) summary = "";
+        if (summary.length() > 600) summary = summary.substring(0, 600);
+        SQLiteDatabase db = getWritableDatabase();
+        ContentValues v = new ContentValues();
+        v.put(COL_D_TIME, System.currentTimeMillis());
+        v.put(COL_D_TALKER, talker);
+        v.put(COL_D_TYPE, type);
+        v.put(COL_D_SUMMARY, summary);
+        db.insert(TABLE_DEBUG, null, v);
+        // 只保留最近 200 条
+        try {
+            db.execSQL("DELETE FROM " + TABLE_DEBUG + " WHERE " + COL_D_ID
+                    + " NOT IN (SELECT " + COL_D_ID + " FROM " + TABLE_DEBUG
+                    + " ORDER BY " + COL_D_ID + " DESC LIMIT 200)");
+        } catch (Throwable ignore) {
+        }
+    }
+
+    public List<String[]> getDebugMessages(int limit) {
+        List<String[]> list = new ArrayList<>();
+        SQLiteDatabase db = getReadableDatabase();
+        try (Cursor c = db.query(TABLE_DEBUG, new String[]{COL_D_TIME, COL_D_TALKER, COL_D_TYPE, COL_D_SUMMARY},
+                null, null, null, null, COL_D_ID + " DESC", String.valueOf(limit))) {
+            while (c.moveToNext()) {
+                list.add(new String[]{
+                        String.valueOf(c.getLong(0)),
+                        c.getString(1),
+                        c.getString(2),
+                        c.getString(3)
+                });
+            }
+        }
+        return list;
+    }
+
+    public int debugCount() {
+        SQLiteDatabase db = getReadableDatabase();
+        try (Cursor c = db.rawQuery("SELECT COUNT(*) FROM " + TABLE_DEBUG, null)) {
+            if (c.moveToFirst()) return c.getInt(0);
+        }
+        return 0;
+    }
+
+    public int clearDebug() {
+        return getWritableDatabase().delete(TABLE_DEBUG, null, null);
     }
 }

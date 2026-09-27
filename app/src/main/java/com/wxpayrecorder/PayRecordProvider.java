@@ -23,6 +23,10 @@ public class PayRecordProvider extends android.content.ContentProvider {
     public static final String METHOD_CLEAR = "clear";
     public static final String METHOD_HEARTBEAT = "heartbeat";
     public static final String METHOD_GET_STATUS = "getStatus";
+    public static final String METHOD_LOG_MSG = "logMsg";
+    public static final String METHOD_GET_DEBUG = "getDebug";
+    public static final String METHOD_CLEAR_DEBUG = "clearDebug";
+    public static final String KEY_DEBUG_COUNT = "debug_count";
 
     // 状态键
     public static final String KEY_HOOK_INSTALLED = "hook_installed";
@@ -88,6 +92,21 @@ public class PayRecordProvider extends android.content.ContentProvider {
                 result.putString(KEY_LAST_MSG_TYPE, db.getStatus(KEY_LAST_MSG_TYPE));
                 result.putString(KEY_LAST_MSG_AMOUNT, db.getStatus(KEY_LAST_MSG_AMOUNT));
                 result.putString(KEY_MSG_COUNT, db.getStatus(KEY_MSG_COUNT));
+                return result;
+            case METHOD_LOG_MSG:
+                // 微信进程 hook 代码写入一条调试消息记录
+                if (extras != null) {
+                    db.insertDebug(extras.getString("talker"),
+                            extras.getString("type"), extras.getString("summary"));
+                }
+                result.putBoolean("ok", true);
+                result.putInt(KEY_DEBUG_COUNT, db.debugCount());
+                return result;
+            case METHOD_GET_DEBUG:
+                result.putInt(KEY_DEBUG_COUNT, db.debugCount());
+                return result;
+            case METHOD_CLEAR_DEBUG:
+                result.putInt("cleared", db.clearDebug());
                 return result;
             default:
                 return null;

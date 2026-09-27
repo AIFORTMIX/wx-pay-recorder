@@ -29,7 +29,9 @@ public class MainActivity extends Activity {
     private DbHelper db;
     private TextView statusView;
     private TextView contentView;
+    private TextView debugView;
     private final SimpleDateFormat fmt = new SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA);
+    private final SimpleDateFormat fmtFull = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA);
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable refreshRunnable = new Runnable() {
         @Override
@@ -80,12 +82,30 @@ public class MainActivity extends Activity {
         export.setText("导出CSV");
         export.setOnClickListener(v -> exportCsv());
 
+        Button clearDebug = new Button(this);
+        clearDebug.setText("清消息流");
+        clearDebug.setOnClickListener(v -> {
+            db.clearDebug();
+            refreshAll();
+        });
+
         LinearLayout btnRow = new LinearLayout(this);
         btnRow.setOrientation(LinearLayout.HORIZONTAL);
         btnRow.addView(refresh, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
         btnRow.addView(clear, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
         btnRow.addView(export, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        btnRow.addView(clearDebug, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
         root.addView(btnRow);
+
+        // ===== 调试消息流（最近收到的微信消息，用于定位收款消息） =====
+        debugView = new TextView(this);
+        debugView.setTextSize(12f);
+        debugView.setPadding(8, 12, 8, 8);
+        debugView.setBackgroundColor(0xFF001020);
+        debugView.setTypeface(android.graphics.Typeface.MONOSPACE);
+        root.addView(debugView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
 
         // ===== 收款记录列表 =====
         contentView = new TextView(this);
@@ -116,7 +136,25 @@ public class MainActivity extends Activity {
 
     private void refreshAll() {
         refreshStatus();
+        refreshDebug();
         refreshList();
+    }
+
+    private void refreshDebug() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== 调试消息流 (最近接收的微信消息) ===\n");
+        java.util.List<String[]> msgs = db.getDebugMessages(20);
+        if (msgs.isEmpty()) {
+            sb.append("(无捕获消息。请付款/收发消息后刷新)\n");
+        }
+        for (String[] m : msgs) {
+            long t = Long.parseLong(m[0]);
+            sb.append(fmt.format(new Date(t)));
+            sb.append("  type=").append(m[2] == null ? "?" : m[2]);
+            sb.append("  talker=").append(m[1] == null ? "?" : m[1]);
+            sb.append("\n  ").append(m[3] == null ? "" : m[3].replace("\u0000", " ") ).append("\n--\n");
+        }
+        debugView.setText(sb.toString());
     }
 
     private void refreshStatus() {
