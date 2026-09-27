@@ -28,4 +28,6 @@ android {
 dependencies {
     // Xposed API：只用于编译（compileOnly），运行时由 LSPosed 提供
     compileOnly 'de.robv.android.xposed:api:82'
+    // AndroidX 注解
+    implementation 'androidx.annotation:annotation:1.7.1'
 }
